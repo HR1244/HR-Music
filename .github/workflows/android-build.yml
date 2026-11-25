@@ -7,13 +7,18 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing stable tag to publish. Leave blank to run the debug build.
+        type: string
+        required: false
 
 permissions:
   contents: read
 
 jobs:
   check:
-    if: github.ref_type != 'tag'
+    if: github.ref_type != 'tag' && (github.event_name != 'workflow_dispatch' || inputs.release_tag == '')
     name: Test and build debug APK
     runs-on: ubuntu-latest
     steps:
@@ -27,8 +32,10 @@ jobs:
           java-version: '21'
           cache: gradle
 
-      - name: Install Android build packages
-        run: sdkmanager --install 'platforms;android-37.0' 'build-tools;36.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+      - name: Set up Android SDK and build packages
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          packages: platforms;android-37.0 build-tools;36.0.0 ndk;28.2.13676358 cmake;3.22.1
 
       - name: Test and build
         run: |
@@ -43,7 +50,9 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: >-
+      (github.event_name == 'push' && github.ref_type == 'tag') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.release_tag != '')
     name: Publish signed release APK
     runs-on: ubuntu-latest
     environment: release
@@ -52,17 +61,20 @@ jobs:
     concurrency:
       group: hr-music-release
       cancel-in-progress: false
+    env:
+      HR_MUSIC_RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
       - name: Validate release tag
         run: |
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+          [[ "$HR_MUSIC_RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
             echo "Use a stable version tag in the form vMAJOR.MINOR.PATCH."
             exit 1
           }
+
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.HR_MUSIC_RELEASE_TAG }}
+          persist-credentials: false
 
       - uses: actions/setup-java@v6
         with:
@@ -70,8 +82,10 @@ jobs:
           java-version: '21'
           cache: gradle
 
-      - name: Install Android build packages
-        run: sdkmanager --install 'platforms;android-37.0' 'build-tools;36.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+      - name: Set up Android SDK and build packages
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          packages: platforms;android-37.0 build-tools;36.0.0 ndk;28.2.13676358 cmake;3.22.1
 
       - name: Build signed APK from this repository
         env:
@@ -104,7 +118,7 @@ jobs:
           version_name="$(jq -er '.elements | if length == 1 then .[0].versionName else error("Expected one universal APK") end' "$metadata")"
           version_code="$(jq -er '.elements[0].versionCode | select(. > 0)' "$metadata")"
           output_file="$(jq -er '.elements[0].outputFile' "$metadata")"
-          [[ "$GITHUB_REF_NAME" == "v$version_name" ]] || {
+          [[ "$HR_MUSIC_RELEASE_TAG" == "v$version_name" ]] || {
             echo "The release tag must match versionName."
             exit 1
           }
@@ -120,5 +134,5 @@ jobs:
 
           asset="$RUNNER_TEMP/HR-Music-Universal-GMS-$version_code.apk"
           cp -- "$output_dir/$output_file" "$asset"
-          gh release create "$GITHUB_REF_NAME" "$asset" --repo "$GITHUB_REPOSITORY" \
+          gh release create "$HR_MUSIC_RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY" \
             --verify-tag --title "HR Music $version_name" --generate-notes --latest
