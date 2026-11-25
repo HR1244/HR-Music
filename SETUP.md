@@ -1,6 +1,6 @@
 # Setup Instructions
 
-This document provides instructions for setting up the Echo Music project for development.
+This document provides instructions for setting up HR Music for development.
 
 ## Prerequisites
 
@@ -14,8 +14,8 @@ This document provides instructions for setting up the Echo Music project for de
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/EchoMusicApp/Echo-Music.git
-cd Echo-Music
+git clone https://github.com/HR1244/HR-Music.git
+cd HR-Music
 ```
 
 ### 2. Configure Local Properties
@@ -67,7 +67,7 @@ Set `HR_MUSIC_UPDATE_REPOSITORY=OWNER/REPOSITORY` in `local.properties` or the e
 
 Open the project in Android Studio or build from the command line.
 
-Echo Music builds as a **GMS** variant with Cast and Firebase support.
+HR Music builds as a **GMS** variant with Cast and optional Firebase support.
 
 ```bash
 # Debug build
@@ -94,6 +94,8 @@ For local Last.fm testing, maintainers can set `HR_MUSIC_LASTFM_API_KEY` and `HR
 5. After the workflow succeeds, install the signed Universal GMS APK from your release for the first time. In **Settings → App Updates**, future versions can be downloaded and installed after Android’s approval. Debug builds install separately and use development signing.
 
 For example, publish the current version with `git tag v1.4.9` and `git push origin v1.4.9` after committing and pushing the release source.
+
+If publication fails and the tag already exists, open **Actions → HR Music Android → Run workflow**, select `main`, and enter the existing tag. The workflow builds the tagged source and publishes the signed release.
 
 If you enabled a Vercel return link, set `HR_MUSIC_VERCEL_CALLBACK_HOST` as an Actions repository variable. The release job prints the APK certificate fingerprint for Android App Links. [GitHub Actions secrets](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets) · [Android app signing](https://developer.android.com/studio/publish/app-signing)
 
