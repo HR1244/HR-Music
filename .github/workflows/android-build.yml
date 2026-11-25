@@ -1,0 +1,124 @@
+name: HR Music Android
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: github.ref_type != 'tag'
+    name: Test and build debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Install Android build packages
+        run: sdkmanager --install 'platforms;android-37.0' 'build-tools;36.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+
+      - name: Test and build
+        run: |
+          chmod +x gradlew
+          ./gradlew :core:testDebugUnitTest :lyrics:testDebugUnitTest :app:testUniversalGmsDebugUnitTest :app:assembleUniversalGmsDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: HR-Music-Universal-GMS-debug
+          path: app/build/outputs/apk/universalGms/debug/*.apk
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    name: Publish signed release APK
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    concurrency:
+      group: hr-music-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate release tag
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Use a stable version tag in the form vMAJOR.MINOR.PATCH."
+            exit 1
+          }
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Install Android build packages
+        run: sdkmanager --install 'platforms;android-37.0' 'build-tools;36.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+
+      - name: Build signed APK from this repository
+        env:
+          HR_MUSIC_UPDATE_REPOSITORY: ${{ github.repository }}
+          ORG_GRADLE_PROJECT_HR_MUSIC_VERCEL_CALLBACK_HOST: ${{ vars.HR_MUSIC_VERCEL_CALLBACK_HOST }}
+          KEYSTORE_BASE64: ${{ secrets.HR_MUSIC_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.HR_MUSIC_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.HR_MUSIC_KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.HR_MUSIC_STORE_PASSWORD }}
+        run: |
+          : "${KEYSTORE_BASE64:?Missing HR_MUSIC_KEYSTORE_BASE64}"
+          : "${KEY_ALIAS:?Missing HR_MUSIC_KEY_ALIAS}"
+          : "${KEY_PASSWORD:?Missing HR_MUSIC_KEY_PASSWORD}"
+          : "${STORE_PASSWORD:?Missing HR_MUSIC_STORE_PASSWORD}"
+          umask 077
+          KEYSTORE_PATH="$(mktemp "$RUNNER_TEMP/hr-music-release.XXXXXX")"
+          export KEYSTORE_PATH
+          trap 'rm -f -- "$KEYSTORE_PATH"' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          unset KEYSTORE_BASE64
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleUniversalGmsRelease
+
+      - name: Verify APK and create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          output_dir=app/build/outputs/apk/universalGms/release
+          metadata="$output_dir/output-metadata.json"
+          version_name="$(jq -er '.elements | if length == 1 then .[0].versionName else error("Expected one universal APK") end' "$metadata")"
+          version_code="$(jq -er '.elements[0].versionCode | select(. > 0)' "$metadata")"
+          output_file="$(jq -er '.elements[0].outputFile' "$metadata")"
+          [[ "$GITHUB_REF_NAME" == "v$version_name" ]] || {
+            echo "The release tag must match versionName."
+            exit 1
+          }
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$output_dir/$output_file"
+
+          previous_codes="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq \
+            '.[] | select(.draft == false and .prerelease == false) | .assets[].name | select(test("^HR-Music-Universal-GMS-[1-9][0-9]*\\.apk$")) | capture("^HR-Music-Universal-GMS-(?<code>[1-9][0-9]*)\\.apk$").code')"
+          highest_code="$(printf '%s\n' "$previous_codes" | sort -n | tail -n 1)"
+          if [[ -n "$highest_code" && "$version_code" -le "$highest_code" ]]; then
+            echo "Increase versionCode beyond the previous HR Music releases."
+            exit 1
+          fi
+
+          asset="$RUNNER_TEMP/HR-Music-Universal-GMS-$version_code.apk"
+          cp -- "$output_dir/$output_file" "$asset"
+          gh release create "$GITHUB_REF_NAME" "$asset" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "HR Music $version_name" --generate-notes --latest

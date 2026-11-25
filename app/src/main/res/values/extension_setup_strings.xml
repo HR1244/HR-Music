@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="extension_setup_title">Set up an audio extension</string>
+    <string name="extension_setup_320_title">320 kbps audio</string>
+    <string name="extension_setup_320_description">Deploy to Cloudflare. Open the deployed site and share it to HR Music.</string>
+    <string name="extension_setup_lossless_title">Lossless audio</string>
+    <string name="extension_setup_lossless_description">Deploy to your Vercel account.</string>
+    <string name="extension_setup_lossless_key_instructions">Vercel needs a private key for this deployment. Copy a new key here and paste it into the environment variable field on Vercel.</string>
+    <string name="extension_setup_connect_by_sharing">After deployment, open the deployed site and share it to HR Music.</string>
+    <string name="extension_setup_lossless_connect_instructions">After deployment, return to HR Music when prompted. You can also open the deployed site and share it to HR Music.</string>
+    <string name="extension_setup_key_label">Vercel setup key</string>
+    <string name="extension_setup_key_copy">Copy private setup key</string>
+    <string name="extension_setup_key_copied">Setup key copied</string>
+    <string name="extension_setup_open_vercel">Open Vercel</string>
+    <string name="extension_setup_browser_unavailable">A browser is required to open the deployment page.</string>
+</resources>

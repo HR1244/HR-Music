@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name" translatable="false">HR Music</string>
+    <string name="hr_music_about_attribution">Based on Echo Music · GPL-3.0</string>
+    <string name="hr_music_default_icon">Default launcher icon</string>
+</resources>

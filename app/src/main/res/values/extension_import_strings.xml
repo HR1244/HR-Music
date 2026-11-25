@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="extension_import_title">Connect %1$s extension</string>
+    <string name="extension_import_provider">Connect your deployment on %1$s.</string>
+    <string name="extension_import_saavn_name">320 kbps</string>
+    <string name="extension_import_lossless_name">Lossless</string>
+    <string name="extension_import_invalid_vercel_callback">Vercel did not return a valid deployment link.</string>
+    <string name="extension_import_save_failed">Could not save the extension. Please try again.</string>
+</resources>

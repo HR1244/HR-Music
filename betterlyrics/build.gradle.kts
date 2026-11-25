@@ -1,0 +1,30 @@
+plugins {
+  id("com.android.library")
+  alias(libs.plugins.kotlin.serialization)
+}
+
+android {
+  namespace = "com.music.betterlyrics"
+  compileSdk {
+    version = release(37) { minorApiLevel = 0 }
+  }
+
+  defaultConfig { minSdk = 26 }
+
+  compileOptions {
+    isCoreLibraryDesugaringEnabled = true
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+  }
+}
+
+kotlin { jvmToolchain(21) }
+
+dependencies {
+  implementation(libs.ktor.client.core)
+  implementation(libs.ktor.client.cio)
+  implementation(libs.ktor.client.content.negotiation)
+  implementation(libs.ktor.serialization.json)
+
+  coreLibraryDesugaring(libs.desugaring)
+}
