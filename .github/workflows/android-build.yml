@@ -37,6 +37,16 @@ jobs:
         with:
           packages: platforms;android-37.0 build-tools;36.0.0 ndk;28.2.13676358 cmake;3.22.1
 
+      - name: Create development signing key if needed
+        run: |
+          debug_keystore="$HOME/.android/debug.keystore"
+          if [[ ! -f "$debug_keystore" ]]; then
+            mkdir -p "$HOME/.android"
+            keytool -genkeypair -keystore "$debug_keystore" -storepass android \
+              -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname 'CN=Android Debug,O=Android,C=US' -noprompt
+          fi
+
       - name: Test and build
         run: |
           chmod +x gradlew

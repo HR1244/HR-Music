@@ -339,7 +339,7 @@ Run tests with:
 
 ## CI
 
-- `.github/workflows/android-build.yml` provisions the Android SDK, tests and builds Universal GMS debug APKs on `main`, and publishes signed Universal GMS APKs for `v<versionName>` tags. Dispatching from `main` with an existing `release_tag` retries publication from that tag's source. See [SETUP.md](SETUP.md#publish-hr-music-on-github) for signing secrets.
+- `.github/workflows/android-build.yml` provisions the Android SDK and generates a development key on fresh runners for Universal GMS debug builds. It publishes signed Universal GMS APKs for `v<versionName>` tags. Dispatching from `main` with an existing `release_tag` retries publication from that tag's source. See [SETUP.md](SETUP.md#publish-hr-music-on-github) for signing secrets.
 - Settings, update notifications, and the startup prompt open the in-app updater. The release workflow embeds its own public GitHub repository. The updater selects the exact Universal GMS release asset, requires a higher Android version code, and verifies the downloaded APK’s package and signing certificate before opening the Android installer.
 - `.github/workflows/codeql.yml` — static analysis / security scanning.
 
