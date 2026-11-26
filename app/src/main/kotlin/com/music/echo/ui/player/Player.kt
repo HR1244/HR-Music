@@ -239,6 +239,10 @@ import echo.music.iad1tya.ui.theme.PlayerColorExtractor
 import echo.music.iad1tya.ui.theme.PlayerSliderColors
 import echo.music.iad1tya.ui.utils.ShowMediaInfo
 import echo.music.iad1tya.ui.utils.ShowOffsetDialog
+import echo.music.iad1tya.ui.utils.audioBitrate
+import echo.music.iad1tya.ui.utils.audioCodecLabel
+import echo.music.iad1tya.ui.utils.formatAudioSampleRate
+import echo.music.iad1tya.ui.utils.rememberCurrentAudioFormat
 import echo.music.iad1tya.utils.PodcastProgress
 import echo.music.iad1tya.utils.dataStore
 import echo.music.iad1tya.utils.isLocalMediaId
@@ -374,23 +378,6 @@ fun BottomSheetPlayer(
   val automixDebugOverlayEnabled by
     rememberPreference(echo.music.iad1tya.constants.AutomixDebugOverlayKey, false)
 
-  var currentAudioFormat by remember { mutableStateOf<androidx.media3.common.Format?>(null) }
-  DisposableEffect(playerConnection, isCrossfading) {
-    val playerToListen = playerConnection.player
-    val listener =
-      object : Player.Listener {
-        override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
-          val audioTrack = tracks.groups.firstOrNull { it.type == C.TRACK_TYPE_AUDIO }
-          currentAudioFormat = audioTrack?.getTrackFormat(0)
-        }
-      }
-    playerToListen.addListener(listener)
-    currentAudioFormat =
-      playerToListen.currentTracks.groups
-        .firstOrNull { it.type == C.TRACK_TYPE_AUDIO }
-        ?.getTrackFormat(0)
-    onDispose { playerToListen.removeListener(listener) }
-  }
   val swipeLyrics by rememberPreference(SwipeLyricsKey, false)
   val enableLyricsThumbnailPlayPause by rememberPreference(EnableLyricsThumbnailPlayPauseKey, false)
   val isKeepScreenOn by rememberPreference(KeepScreenOn, false)
@@ -501,7 +488,6 @@ fun BottomSheetPlayer(
     }
 
   val playbackState by playerConnection.playbackState.collectAsState()
-  val currentFormatEntity by database.format(mediaMetadata?.id).collectAsState(initial = null)
   val currentSong by playerConnection.currentSong.collectAsState(initial = null)
   val automix by playerConnection.service.automixItems.collectAsState()
   val repeatMode by playerConnection.repeatMode.collectAsState()
@@ -529,6 +515,10 @@ fun BottomSheetPlayer(
       }
     }
   val isCasting by castHandler?.isCasting?.collectAsState() ?: remember { mutableStateOf(false) }
+  val currentAudioFormat = rememberCurrentAudioFormat(
+    playerConnection.player.takeUnless { isCasting || !showCodecOnPlayer },
+    mediaMetadata?.id,
+  )
   val castDeviceName by
     castHandler?.castDeviceName?.collectAsState() ?: remember { mutableStateOf(null) }
   val castPosition by
@@ -2435,61 +2425,14 @@ fun BottomSheetPlayer(
           horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
         ) {
           val formatText =
-            remember(currentAudioFormat, currentFormatEntity) {
-              val localAudioFormat = currentAudioFormat
-              val localFormatEntity = currentFormatEntity
-
-              val sampleMime = localAudioFormat?.sampleMimeType?.lowercase().orEmpty()
-              val entityMime = localFormatEntity?.mimeType?.lowercase().orEmpty()
-              val entityCodecs = localFormatEntity?.codecs?.lowercase().orEmpty()
-
-              val codecStr =
-                when {
-                  sampleMime.contains("alac") -> "ALAC"
-                  sampleMime.contains("flac") -> "FLAC"
-                  sampleMime.contains("opus") -> "OPUS"
-                  sampleMime.contains("mp4a") || sampleMime.contains("aac") -> "AAC"
-                  sampleMime.contains("mpeg") || sampleMime.contains("mp3") -> "MP3"
-                  sampleMime.contains("vorbis") -> "VORBIS"
-                  // Fallbacks if ExoPlayer track format not ready yet:
-                  entityCodecs.contains("alac") || entityMime.contains("alac") -> "ALAC"
-                  entityCodecs.contains("flac") || entityMime.contains("flac") -> "FLAC"
-                  entityCodecs.contains("opus") ||
-                    entityMime.contains("opus") ||
-                    entityMime.contains("webm") -> "OPUS"
-                  entityCodecs.contains("mp4a") ||
-                    entityCodecs.contains("aac") ||
-                    entityMime.contains("mp4") -> "AAC"
-                  entityCodecs.contains("mp3") || entityMime.contains("mpeg") -> "MP3"
-                  entityCodecs.isNotBlank() && entityCodecs != "unknown" -> entityCodecs.uppercase()
-                  sampleMime.isNotBlank() -> sampleMime.substringAfter("audio/").uppercase()
-                  entityMime.isNotBlank() -> entityMime.substringAfter("audio/").uppercase()
-                  else -> ""
-                }
-
-              val rawBitrate =
-                when {
-                  localAudioFormat != null && localAudioFormat.bitrate > 0 ->
-                    localAudioFormat.bitrate
-                  localAudioFormat != null && localAudioFormat.averageBitrate > 0 ->
-                    localAudioFormat.averageBitrate
-                  localFormatEntity != null && localFormatEntity.bitrate > 0 -> {
-                    // Guard against stale poisoned bitrate (e.g. 1411200 saved for an opus/aac
-                    // stream)
-                    if (
-                      (codecStr == "OPUS" || codecStr == "AAC") &&
-                        localFormatEntity.bitrate > 400000
-                    ) {
-                      if (codecStr == "OPUS") 160000 else 256000
-                    } else {
-                      localFormatEntity.bitrate
-                    }
-                  }
-                  else -> 0
-                }
-
-              val bitrateStr = if (rawBitrate > 0) "${rawBitrate / 1000} kbps" else ""
-              listOf(codecStr, bitrateStr).filter { it.isNotEmpty() }.joinToString(" • ")
+            remember(currentAudioFormat) {
+              currentAudioFormat?.let { format ->
+                listOfNotNull(
+                  format.audioCodecLabel(),
+                  format.sampleRate.takeIf { it > 0 }?.let(::formatAudioSampleRate),
+                  format.audioBitrate()?.let { "${it / 1000} kbps" },
+                ).joinToString(" • ")
+              }.orEmpty()
             }
 
           val isBuffering = playbackState == androidx.media3.common.Player.STATE_BUFFERING

@@ -507,9 +507,6 @@ constructor(
     downloads.value[mediaId]?.takeIf { it.state == Download.STATE_COMPLETED }?.request
       ?.let { it.customCacheKey ?: it.id }
 
-  internal fun completedDownloadQuality(mediaId: String): DownloadQuality? =
-    completedDownloadCacheKey(mediaId)?.let { DownloadSource.fromCacheKey(it).quality }
-
   private fun verifiesLossless(url: String, codec: String?): Boolean {
     if (Uri.parse(url).scheme !in setOf("https", "http")) return false
     val extractor = MediaExtractor()

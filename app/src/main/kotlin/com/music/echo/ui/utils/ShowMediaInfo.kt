@@ -27,7 +27,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -43,6 +45,13 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.media3.common.C
+import androidx.media3.common.Format
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import coil3.compose.AsyncImage
 import com.music.innertube.YouTube
 import com.music.innertube.models.MediaInfo
@@ -54,6 +63,70 @@ import echo.music.iad1tya.db.entities.Song
 import echo.music.iad1tya.ui.component.LocalBottomSheetPageState
 import echo.music.iad1tya.ui.component.shimmer.ShimmerHost
 import echo.music.iad1tya.ui.component.shimmer.TextPlaceholder
+import java.text.NumberFormat
+import java.util.Locale
+
+@Composable
+@androidx.annotation.OptIn(UnstableApi::class)
+internal fun rememberCurrentAudioFormat(player: ExoPlayer?, mediaId: String?): Format? {
+  var format by remember(player, mediaId) { mutableStateOf<Format?>(null) }
+  DisposableEffect(player, mediaId) {
+    if (player == null || mediaId == null) return@DisposableEffect onDispose {}
+
+    fun refresh() {
+      if (player.currentMediaItem?.mediaId != mediaId || player.playbackState == Player.STATE_IDLE) {
+        format = null
+        return
+      }
+      val selected = player.currentTracks.groups
+        .filter { it.type == C.TRACK_TYPE_AUDIO }
+        .flatMap { group ->
+          (0 until group.length).filter(group::isTrackSelected).map(group::getTrackFormat)
+        }
+      // Adaptive selections can contain several candidates. Use the format consumed by the renderer.
+      format = player.audioFormat?.takeIf { it in selected } ?: selected.singleOrNull()
+    }
+
+    val listener = object : AnalyticsListener {
+      override fun onEvents(player: Player, events: AnalyticsListener.Events) {
+        if (events.containsAny(
+            Player.EVENT_MEDIA_ITEM_TRANSITION,
+            Player.EVENT_PLAYBACK_STATE_CHANGED,
+            Player.EVENT_TRACKS_CHANGED,
+            AnalyticsListener.EVENT_AUDIO_INPUT_FORMAT_CHANGED,
+          )
+        ) refresh()
+      }
+    }
+    player.addAnalyticsListener(listener)
+    refresh()
+    onDispose { player.removeAnalyticsListener(listener) }
+  }
+  return format
+}
+
+internal fun Format.audioCodecLabel(): String? = when (val mime = sampleMimeType) {
+  MimeTypes.AUDIO_ALAC -> "ALAC"
+  MimeTypes.AUDIO_FLAC -> "FLAC"
+  MimeTypes.AUDIO_OPUS -> "OPUS"
+  MimeTypes.AUDIO_AAC -> "AAC"
+  MimeTypes.AUDIO_MPEG -> "MP3"
+  MimeTypes.AUDIO_VORBIS -> "VORBIS"
+  MimeTypes.AUDIO_RAW -> "PCM"
+  else -> codecs?.uppercase(Locale.ROOT) ?: mime?.substringAfter("audio/")?.uppercase(Locale.ROOT)
+}
+
+internal fun Format.audioBitrate(): Int? =
+  averageBitrate.takeIf { it > 0 } ?: peakBitrate.takeIf { it > 0 }
+
+internal fun formatAudioSampleRate(sampleRate: Int): String {
+  if (sampleRate < 1000) return "$sampleRate Hz"
+  val number = NumberFormat.getNumberInstance().apply {
+    isGroupingUsed = false
+    maximumFractionDigits = 3
+  }.format(sampleRate / 1000.0)
+  return "$number kHz"
+}
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -64,8 +137,19 @@ fun ShowMediaInfo(videoId: String) {
   var info by remember { mutableStateOf<MediaInfo?>(null) }
   val database = LocalDatabase.current
   var song by remember { mutableStateOf<Song?>(null) }
-  var currentFormat by remember { mutableStateOf<FormatEntity?>(null) }
+  var currentFormat by remember(videoId) { mutableStateOf<FormatEntity?>(null) }
   val playerConnection = LocalPlayerConnection.current
+  val playingMediaId = playerConnection?.mediaMetadata?.collectAsState()?.value?.id
+  val isCurrentSong = playingMediaId == videoId
+  val isCasting =
+    playerConnection?.service?.castConnectionHandler?.isCasting?.collectAsState()?.value == true
+  val audioFormat =
+    rememberCurrentAudioFormat(playerConnection?.player?.takeUnless { isCasting }, videoId)
+  val storedAudioFormat = currentFormat.takeUnless { isCurrentSong }
+  val mimeType = audioFormat?.sampleMimeType ?: storedAudioFormat?.mimeType?.substringBefore(';')
+  val bitrate = audioFormat?.audioBitrate() ?: storedAudioFormat?.bitrate?.takeIf { it > 0 }
+  val codec = audioFormat?.audioCodecLabel() ?: storedAudioFormat?.codecs
+  val sampleRate = (audioFormat?.sampleRate ?: storedAudioFormat?.sampleRate)?.takeIf { it > 0 }
   val context = LocalContext.current
   val sheetState = LocalBottomSheetPageState.current
   val clipboardManager = LocalClipboard.current
@@ -226,14 +310,12 @@ fun ShowMediaInfo(videoId: String) {
           ) {
             InfoItem(
               label = stringResource(R.string.mime_type),
-              value =
-                currentFormat?.mimeType?.substringBefore(";")
-                  ?: stringResource(R.string.song_info_standard),
+              value = mimeType ?: "N/A",
               modifier = Modifier.weight(1f)
             )
             InfoItem(
               label = stringResource(R.string.bitrate),
-              value = currentFormat?.bitrate?.let { "${it / 1000} Kbps" } ?: "N/A",
+              value = bitrate?.let { "${it / 1000} kbps" } ?: "N/A",
               modifier = Modifier.weight(1f)
             )
           }
@@ -244,12 +326,12 @@ fun ShowMediaInfo(videoId: String) {
           ) {
             InfoItem(
               label = stringResource(R.string.codecs),
-              value = currentFormat?.codecs ?: "N/A",
+              value = codec ?: "N/A",
               modifier = Modifier.weight(1f)
             )
             InfoItem(
               label = stringResource(R.string.sample_rate),
-              value = currentFormat?.sampleRate?.let { "$it Hz" } ?: "N/A",
+              value = sampleRate?.let(::formatAudioSampleRate) ?: "N/A",
               modifier = Modifier.weight(1f)
             )
           }

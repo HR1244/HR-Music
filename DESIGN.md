@@ -61,6 +61,7 @@ Do NOT strictly force Material 3 components if they break the app's custom aesth
 *   **Rounded Shapes:** Elements heavily lean towards large corner radii (`RoundedCornerShape(24.dp)` or `CircleShape`), providing a friendlier, softer UI.
 *   **Settings Groups:** We use a grouped-list style (similar to iOS Settings) by encapsulating lists within a `surfaceContainerHighest` card with `24.dp` corners, rather than separate pill cards.
 *   **Audio Extension Setup:** Put provider setup rows together on the Extension Sources screen, above installed sources. Use the regular settings row and chevron for browser handoffs, with a confirmation before saving an imported deployment.
+*   **Audio Format:** The player codec badge and current Song Info show the selected audio track's codec and sample rate. Clear those details while the player selects the new track.
 
 ### Cards & Surfaces
 *   **Custom Cards:** Unlike standard M3 cards (which use solid `surfaceContainer` colors), Echo Music cards typically use:

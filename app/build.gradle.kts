@@ -38,8 +38,8 @@ android {
     resValue("string", "shortcut_target_package", hrMusicApplicationId)
     minSdk = 26
     targetSdk = 36
-    versionCode = 170
-    versionName = "1.4.9"
+    versionCode = 171
+    versionName = "1.4.10"
 
     val updateRepository =
       System.getenv("HR_MUSIC_UPDATE_REPOSITORY")

@@ -571,8 +571,9 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   private var retryCount = 0
   private var silenceSkipJob: Job? = null
 
-  private val songUrlCache = ConcurrentHashMap<String, ResolvedStream>()
-
+  @Volatile
+  private var songUrlCache = ConcurrentHashMap<String, ResolvedStream>()
+  private var retainedResolutionMediaId: String? = null
 
   private var currentMediaIdRetryCount = mutableMapOf<String, Int>()
   private val MAX_RETRY_PER_SONG = 3
@@ -773,6 +774,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
     connectivityManager = getSystemService()!!
     connectivityObserver = NetworkConnectivityObserver(this)
+    isNetworkConnected.value = connectivityObserver.isCurrentlyConnected()
 
     val screenStateFilter =
       IntentFilter().apply {
@@ -866,6 +868,21 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         .map { readPlaybackQualityPolicy() }
         .distinctUntilChanged()
         .collect { applyPlaybackQualityPolicy(it) }
+    }
+
+    scope.launch {
+      var previousSources: List<Pair<String, String>>? = null
+      extensionManager.observeAddons()
+        .map { addons -> addons.filter { it.enabled }.map { it.id to it.url } }
+        .distinctUntilChanged()
+        .collect { sources ->
+          val oldSources = previousSources
+          previousSources = sources
+          if (oldSources != null) {
+            val newSourceAvailable = sources.any { it !in oldSources }
+            refreshRemotePlayback(newSourceAvailable && currentTrackCanUpgradeToLossless())
+          }
+        }
     }
 
     scope.launch {
@@ -2896,6 +2913,10 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     mediaItem: MediaItem?,
     reason: Int,
   ) {
+    retainedResolutionMediaId?.takeIf { it != mediaItem?.mediaId }?.let {
+      invalidateStreamUrls(it)
+      retainedResolutionMediaId = null
+    }
     cutoffGuard.onTrackChanged(mediaItem?.mediaId)
     val prevItem = trackedMediaItem
     resumePodcastPosition(mediaItem, prevItem, reason)
@@ -4141,18 +4162,18 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
       val policy = playbackQualityPolicy
       val completedCacheKey = downloadUtil.completedDownloadCacheKey(mediaId)
-      val useCompletedDownload =
+      val useLossyDownloadFirst = policy.canStartWithLossyDownload()
+      if (
         completedCacheKey != null &&
-          (!policy.requiresCertainQuality ||
-            (policy.requested == AudioQuality.LOSSLESS &&
-              downloadUtil.completedDownloadQuality(mediaId) == DownloadQuality.LOSSLESS))
-      if (useCompletedDownload) {
+          policy.canStartWithCompletedDownload(completedCacheKey, useLossyDownloadFirst)
+      ) {
         scope.launch(Dispatchers.IO) { recoverSong(mediaId, isOfflinePlayback = true) }
         return@Factory dataSpec.buildUpon().setKey(completedCacheKey).build()
       }
 
       val streamKey = policy.streamKey(mediaId)
-      val cachedStream = songUrlCache[streamKey]?.takeIf { it.expiresAtMs > System.currentTimeMillis() }
+      val resolutionCache = songUrlCache
+      val cachedStream = resolutionCache[streamKey]?.takeIf { it.expiresAtMs > System.currentTimeMillis() }
       if (cachedStream != null) {
         registerPlayback(mediaId, cachedStream, completedCacheKey == null)
         return@Factory cachedStream.resolve(dataSpec.buildUpon().setKey(cachedStream.cacheKey(mediaId)).build())
@@ -4160,11 +4181,11 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
       val stream =
         runBlocking(Dispatchers.IO) {
-          if (!policy.requiresCertainQuality && completedCacheKey == null && hasLegacyDownload(mediaId)) {
+          if (useLossyDownloadFirst && completedCacheKey == null && hasLegacyDownload(mediaId)) {
             return@runBlocking null
           }
           resolveRemoteTrack(mediaId, policy).also { resolved ->
-            if (playbackQualityPolicy == policy) songUrlCache[streamKey] = resolved
+            if (playbackQualityPolicy == policy) resolutionCache[streamKey] = resolved
           }
         }
       if (stream == null) {
@@ -4192,11 +4213,26 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   private fun applyPlaybackQualityPolicy(policy: PlaybackQualityPolicy) {
     if (policy == playbackQualityPolicy) return
     playbackQualityPolicy = policy
-    preloadJob?.cancel()
-    songUrlCache.clear()
-    releasePrebuffered()
+    refreshRemotePlayback(restartCurrent = true)
+  }
+
+  private fun refreshRemotePlayback(restartCurrent: Boolean) {
     val item = player.currentMediaItem
-    if (item != null && !item.mediaId.isLocalMediaId()) {
+    val refreshedCache = ConcurrentHashMap<String, ResolvedStream>()
+    retainedResolutionMediaId = null
+    if (!restartCurrent && item != null) {
+      val key = playbackQualityPolicy.streamKey(item.mediaId)
+      songUrlCache[key]?.let { stream ->
+        // Keep later reads from the active media source on the same rendition.
+        refreshedCache[key] = stream
+        retainedResolutionMediaId = item.mediaId
+      }
+    }
+    // Resolutions already in flight can only update the superseded cache.
+    songUrlCache = refreshedCache
+    preloadJob?.cancel()
+    releasePrebuffered()
+    if (restartCurrent && item != null && !item.mediaId.isLocalMediaId()) {
       val index = player.currentMediaItemIndex
       val position = player.currentPosition
       val playWhenReady = player.playWhenReady
@@ -4207,6 +4243,36 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     }
     preloadUpcomingItems()
   }
+
+  private fun currentTrackCanUpgradeToLossless(): Boolean {
+    val policy = playbackQualityPolicy
+    if (policy.requested != AudioQuality.LOSSLESS || player.playbackState == Player.STATE_ENDED) {
+      return false
+    }
+    val mediaId = player.currentMediaItem?.mediaId ?: return false
+    if (mediaId.isLocalMediaId() || mediaId.startsWith("navidrome_") || mediaId.startsWith("jellyfin_")) {
+      return false
+    }
+
+    val audio = player.currentTracks.groups.firstOrNull { it.type == C.TRACK_TYPE_AUDIO && it.isSelected }
+    val selectedFormat = audio?.let { group ->
+      (0 until group.length).firstOrNull(group::isTrackSelected)?.let(group::getTrackFormat)
+    }
+    if (selectedFormat?.sampleMimeType != null) {
+      return !AudioSourceQuality.from(selectedFormat.sampleMimeType, selectedFormat.codecs).isLossless
+    }
+    val cached = songUrlCache[policy.streamKey(mediaId)] ?: return false
+    return !cached.isFromExtension
+  }
+
+  private fun PlaybackQualityPolicy.canStartWithLossyDownload(): Boolean =
+    !requiresCertainQuality && (requested != AudioQuality.LOSSLESS || !isNetworkConnected.value)
+
+  private fun PlaybackQualityPolicy.canStartWithCompletedDownload(
+    cacheKey: String,
+    canStartWithLossyDownload: Boolean,
+  ): Boolean = canStartWithLossyDownload ||
+    (requested == AudioQuality.LOSSLESS && DownloadSource.fromCacheKey(cacheKey).quality == DownloadQuality.LOSSLESS)
 
   private fun PlaybackQualityPolicy.streamKey(mediaId: String): String =
     "${mediaId}_${requested.name}_$allowDowngrade"
@@ -4280,6 +4346,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           qualities = policy.addonQualities,
           accepts = { policy.accepts(it.audioFormat) },
           preferred = { policy.requested != AudioQuality.LOSSLESS || it.audioFormat.isLossless },
+          preferCdQualityFlac = policy.requested == AudioQuality.LOSSLESS,
         )
         if (addon != null) {
           return ResolvedStream.from(
@@ -4338,7 +4405,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         averageBitrate = actual.bitrate,
         audioQuality = if (actual.isLossless) "AUDIO_QUALITY_LOSSLESS" else null,
         approxDurationMs = null,
-        audioSampleRate = null,
+        audioSampleRate = actual.sampleRate,
         audioChannels = null,
         loudnessDb = null,
         lastModified = null,
@@ -5746,17 +5813,21 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         for (mediaId in upcomingMediaIds) {
           val policy = playbackQualityPolicy
           val streamKey = policy.streamKey(mediaId)
+          val resolutionCache = songUrlCache
           val hasCachedStream =
-            songUrlCache[streamKey]?.expiresAtMs?.let { it > System.currentTimeMillis() } == true
+            resolutionCache[streamKey]?.expiresAtMs?.let { it > System.currentTimeMillis() } == true
+          val completedCacheKey = downloadUtil.completedDownloadCacheKey(mediaId)
+          val useLossyDownloadFirst = policy.canStartWithLossyDownload()
+          val useCompletedDownload = completedCacheKey != null &&
+            policy.canStartWithCompletedDownload(completedCacheKey, useLossyDownloadFirst)
           if (
-            !mediaId.isLocalMediaId() && !hasCachedStream &&
-              downloadUtil.completedDownloadCacheKey(mediaId) == null &&
-              (policy.requiresCertainQuality || !hasLegacyDownload(mediaId))
+            !mediaId.isLocalMediaId() && !hasCachedStream && !useCompletedDownload &&
+              (!useLossyDownloadFirst || completedCacheKey != null || !hasLegacyDownload(mediaId))
           ) {
             try {
               val resolved = resolveRemoteTrack(mediaId, policy)
-              if (!isActive || playbackQualityPolicy != policy) break
-              val stream = songUrlCache.compute(streamKey) { _, existing ->
+              if (!isActive || playbackQualityPolicy != policy || songUrlCache !== resolutionCache) break
+              val stream = resolutionCache.compute(streamKey) { _, existing ->
                 existing?.takeIf { it.expiresAtMs > System.currentTimeMillis() } ?: resolved
               } ?: resolved
               val knownLength = stream.playbackData?.format?.contentLength?.takeIf { it > 0 }

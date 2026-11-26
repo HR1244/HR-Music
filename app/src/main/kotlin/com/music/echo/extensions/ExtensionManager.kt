@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -61,6 +62,7 @@ data class AddonStreamResponse(
     val audioQuality: String = "",
     val codec: String? = null,
     val bitrate: Int? = null,
+    @Transient internal val verifiedFlacSampleRate: Int? = null,
 )
 
 @Serializable
@@ -103,6 +105,10 @@ class ExtensionManager @Inject constructor(
                 return system.ifEmpty { okhttp3.Dns.SYSTEM.lookup(hostname) }
             }
         })
+        .build()
+    private val flacProbeClient = httpClient.newBuilder()
+        .callTimeout(3, java.util.concurrent.TimeUnit.SECONDS)
+        .followSslRedirects(false)
         .build()
     private val ADDONS_KEY = stringPreferencesKey("extensions_addons_list")
     private val json = Json { ignoreUnknownKeys = true }
@@ -417,6 +423,7 @@ class ExtensionManager @Inject constructor(
         trackId: String,
         qualities: List<AddonStreamQuality>,
         accepts: (AddonStreamResponse) -> Boolean,
+        preferCdQualityFlac: Boolean,
     ): AddonStreamResponse? {
         for (quality in qualities) {
             kotlin.coroutines.coroutineContext.ensureActive()
@@ -435,9 +442,33 @@ class ExtensionManager @Inject constructor(
                 android.util.Log.w("ExtensionManager", "Invalid addon stream response for $baseUrl", e)
                 null
             }
-            if (stream != null && stream.url.isNotBlank() && accepts(stream)) return stream
+            if (stream == null || stream.url.isBlank()) continue
+            val candidate = if (preferCdQualityFlac && quality == AddonStreamQuality.LOSSLESS) {
+                verifyNativeFlac(stream)
+            } else stream
+            if (accepts(candidate)) return candidate
         }
         return null
+    }
+
+    private fun verifyNativeFlac(stream: AddonStreamResponse): AddonStreamResponse {
+        val codec = stream.audioFormat.codec
+        if (codec != null && codec != "flac") return stream
+        val url = stream.url.toHttpUrlOrNull()?.takeIf { it.isHttps } ?: return stream
+        val length = AudioSourceQuality.FLAC_STREAM_INFO_BYTES.toLong()
+        val request = Request.Builder().url(url).header("Range", "bytes=0-${length - 1}").build()
+        val header = try {
+            flacProbeClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return stream
+                val source = response.body?.source() ?: return stream
+                if (!source.request(length)) return stream
+                source.readByteArray(length)
+            }
+        } catch (_: IOException) {
+            return stream
+        }
+        val sampleRate = AudioSourceQuality.nativeFlacSampleRate(header) ?: return stream
+        return stream.copy(format = "flac", codec = "flac", verifiedFlacSampleRate = sampleRate)
     }
 
     /**
@@ -453,6 +484,7 @@ class ExtensionManager @Inject constructor(
         qualities: List<AddonStreamQuality> = listOf(AddonStreamQuality.LOSSLESS),
         accepts: (AddonStreamResponse) -> Boolean = { true },
         preferred: (AddonStreamResponse) -> Boolean = { true },
+        preferCdQualityFlac: Boolean = false,
     ): AddonStreamResponse? = withContext(Dispatchers.IO) {
         val addons = getAddons().filter { it.enabled }
         if (addons.isEmpty()) return@withContext null
@@ -460,15 +492,26 @@ class ExtensionManager @Inject constructor(
         val direct = if (isAddonTrack) findAddonForFullId(videoId, addons) else null
         var unavailableAddonId: String? = null
         var fallback: AddonStreamResponse? = null
+        fun rank(stream: AddonStreamResponse): Int = when {
+            preferCdQualityFlac && stream.audioFormat.is44100HzFlac -> 3
+            preferCdQualityFlac && stream.verifiedFlacSampleRate != null -> 2
+            preferred(stream) -> 1
+            else -> 0
+        }
+        fun consider(stream: AddonStreamResponse): Boolean {
+            val rank = rank(stream)
+            if (rank > (fallback?.let(::rank) ?: -1)) fallback = stream
+            return if (preferCdQualityFlac) rank == 3 else rank == 1
+        }
         if (direct != null && direct.second.isNotBlank()) {
-            fallback = try {
-                fetchCompatibleStream(baseUrlFor(direct.first), direct.second, qualities, accepts)
+            val stream = try {
+                fetchCompatibleStream(baseUrlFor(direct.first), direct.second, qualities, accepts, preferCdQualityFlac)
             } catch (e: IOException) {
                 unavailableAddonId = direct.first.id
                 android.util.Log.w("ExtensionManager", "Selected addon could not be reached", e)
                 null
             }
-            if (fallback != null && preferred(fallback)) return@withContext fallback
+            if (stream != null && consider(stream)) return@withContext stream
         }
         if (title.isNullOrBlank() || artist.isNullOrBlank()) {
             return@withContext fallback
@@ -500,10 +543,11 @@ class ExtensionManager @Inject constructor(
                 }
             }
             for (searchBase in searchBases) {
-                var match: AddonTrack? = null
+                var matches: List<AddonTrack> = emptyList()
                 for (query in candidateQueries) {
                     android.util.Log.e("ExtensionManager", "Searching addon $searchBase for $query")
-                    val searchUrl = "$searchBase/search?q=${encodeQuery(query)}"
+                    val qualityQuery = if (preferCdQualityFlac) "&quality=LOSSLESS" else ""
+                    val searchUrl = "$searchBase/search?q=${encodeQuery(query)}$qualityQuery"
                     val searchResponse = try {
                         httpClient.newCall(Request.Builder().url(searchUrl).build()).execute()
                     } catch (e: CancellationException) {
@@ -517,55 +561,58 @@ class ExtensionManager @Inject constructor(
                         continue
                     }
 
-                    val currentMatch = try {
+                    val tracks = try {
                         searchResponse.use { response ->
                             val body = response.body?.string()
                             if (!response.isSuccessful || body.isNullOrEmpty()) {
                                 android.util.Log.e("ExtensionManager", "Search failed: ${response.code} from $searchBase")
-                                null
+                                emptyList()
                             } else {
-                                selectBestMatch(
-                                    json.decodeFromString<AddonSearchResponse>(body).tracks,
-                                    title,
-                                    artist,
-                                    duration,
-                                    requireSameRecording = isAddonTrack,
-                                )
+                                json.decodeFromString<AddonSearchResponse>(body).tracks
                             }
                         }
                     } catch (e: Exception) {
                         android.util.Log.e("ExtensionManager", "Addon response failed for $searchBase", e)
-                        null
+                        emptyList()
                     }
 
-                    if (currentMatch != null) {
-                        match = currentMatch
+                    val match = selectBestMatch(tracks, title, artist, duration, requireSameRecording = isAddonTrack)
+                    if (match != null) {
+                        matches = if (preferCdQualityFlac) equivalentReleases(match, tracks) else listOf(match)
                         break
                     }
                 }
 
-                if (match == null) {
+                if (matches.isEmpty()) {
                     android.util.Log.e("ExtensionManager", "No reliable addon match for $title - $artist on $searchBase")
                     continue
                 }
 
-                android.util.Log.e("ExtensionManager", "Matched track: ${match.title} by ${match.artist}. Fetching stream...")
-                if (direct != null && addon.id == direct.first.id && searchBase == baseUrl && match.id == direct.second) {
-                    continue
-                }
-                val streamData = try {
-                    fetchCompatibleStream(searchBase, match.id, qualities, accepts)
+                try {
+                    for (match in matches) {
+                        if (direct != null && addon.id == direct.first.id && searchBase == baseUrl && match.id == direct.second) {
+                            continue
+                        }
+                        val stream = fetchCompatibleStream(searchBase, match.id, qualities, accepts, preferCdQualityFlac)
+                        if (stream != null && consider(stream)) return@withContext stream
+                    }
                 } catch (e: IOException) {
                     android.util.Log.w("ExtensionManager", "Addon could not be reached", e)
                     break
                 }
-                if (streamData != null) {
-                    if (preferred(streamData)) return@withContext streamData
-                    if (fallback == null) fallback = streamData
-                }
             }
         }
         fallback
+    }
+
+    private fun equivalentReleases(best: AddonTrack, tracks: List<AddonTrack>): List<AddonTrack> {
+        val duration = best.duration?.takeIf { it > 0 } ?: return listOf(best)
+        val alternate = tracks.firstOrNull { track ->
+            track.id.isNotBlank() && track.id != best.id && track.title.equals(best.title, ignoreCase = true) &&
+                track.artist.equals(best.artist, ignoreCase = true) && track.duration != null &&
+                kotlin.math.abs(track.duration.toLong() - duration) <= 2
+        }
+        return listOfNotNull(best, alternate)
     }
 
     /**
