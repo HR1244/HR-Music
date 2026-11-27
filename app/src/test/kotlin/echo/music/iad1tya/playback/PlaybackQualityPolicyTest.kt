@@ -1,6 +1,5 @@
 package echo.music.iad1tya.playback
 
-import androidx.media3.common.C
 import com.music.echo.extensions.AddonStreamQuality
 import com.music.echo.extensions.AudioSourceQuality
 import com.music.innertube.models.response.PlayerResponse
@@ -89,14 +88,6 @@ class PlaybackQualityPolicyTest {
     val low = playback("audio/mp4; codecs=mp4a.40.2", 64_000)
 
     assertNull(policy.resolveYouTubePlayback { Result.success(if (it) low else high) })
-  }
-
-  @Test
-  fun `lossless startup caps the target at the remaining duration`() {
-    assertEquals(60_000_000L, losslessStartupTargetUs(C.TIME_UNSET, 0))
-    assertEquals(60_000_000L, losslessStartupTargetUs(180_000_000, 20_000_000))
-    assertEquals(25_000_000L, losslessStartupTargetUs(50_000_000, 25_000_000))
-    assertEquals(0L, losslessStartupTargetUs(20_000_000, 21_000_000))
   }
 
   private fun playback(mimeType: String, bitrate: Int): PlaybackData = PlaybackData(

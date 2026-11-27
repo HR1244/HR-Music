@@ -377,10 +377,16 @@ fun Thumbnail(
         PlaybackError(
           error = playbackError,
           retry = {
-            playerConnection.player.prepare()
-            playerConnection.player.play()
+            val player = playerConnection.player
+            if (player.playerError === playbackError) {
+              player.prepare()
+              player.play()
+            }
           },
           modifier = Modifier.fillMaxSize(),
+          playAvailableQuality = if (playerConnection.service.canPlayCurrentWithAvailableQuality(playbackError)) {
+            { playerConnection.service.playCurrentWithAvailableQuality(playbackError) }
+          } else null,
         )
       }
     }

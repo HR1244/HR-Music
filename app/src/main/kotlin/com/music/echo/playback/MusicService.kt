@@ -59,6 +59,7 @@ import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.ShuffleOrder.DefaultShuffleOrder
+import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
 import androidx.media3.session.CommandButton
 import androidx.media3.session.MediaController
 import androidx.media3.session.MediaLibraryService
@@ -156,6 +157,7 @@ import echo.music.iad1tya.extensions.metadata
 import echo.music.iad1tya.extensions.setOffloadEnabled
 import echo.music.iad1tya.extensions.toEnum
 import echo.music.iad1tya.extensions.toMediaItem
+import echo.music.iad1tya.generate.LocalTasteEngine
 import echo.music.iad1tya.generate.SongPlayStatsRepository
 import echo.music.iad1tya.lyrics.LyricsHelper
 import echo.music.iad1tya.models.PersistPlayerState
@@ -195,6 +197,7 @@ import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import kotlin.coroutines.coroutineContext
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -256,6 +259,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
   @Inject
   lateinit var songPlayStatsRepository: SongPlayStatsRepository
+  @Inject lateinit var localTasteEngine: LocalTasteEngine
 
   @Inject
   lateinit var navidromeRepository: com.music.echo.cloud.NavidromeRepository
@@ -404,6 +408,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
   @Volatile
   private var playbackQualityPolicy = PlaybackQualityPolicy(AudioQuality.AUTO, allowDowngrade = true)
+  @Volatile
+  private var allowAvailableQualityFor: String? = null
   private lateinit var ipVersion: IpVersion
 
   fun getEffectiveAudioQuality(): echo.music.iad1tya.constants.AudioQuality {
@@ -554,9 +560,11 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   // Cached playback preferences kept in sync with DataStore.
   private var cachedRepeatMode: Int = REPEAT_MODE_OFF
   private var cachedShuffleEnabled: Boolean = false
-  private var cachedPreloadEnabled: Boolean = true
+  private var cachedPreloadEnabled: Boolean = false
   private var cachedPreloadLimit: Int = 1
   private var cachedPreloadLyrics: Boolean = true
+  @Volatile private var bufferDataSaverEnabled = false
+  @Volatile private var bufferNetworkMetered = true
 
   val automixItems = MutableStateFlow<List<MediaItem>>(emptyList())
 
@@ -830,8 +838,13 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
     scope.launch {
       connectivityObserver.networkStatus.collect { isConnected ->
+        val metered = isActiveNetworkMetered()
+        val shouldReschedulePreload = !isNetworkConnected.value || bufferNetworkMetered != metered
+        bufferNetworkMetered = metered
         isNetworkConnected.value = isConnected
         if (isConnected) applyPlaybackQualityPolicy(readPlaybackQualityPolicy())
+        if (!isConnected || bufferNetworkMetered) preloadJob?.cancel()
+        else if (shouldReschedulePreload) preloadUpcomingItems()
         if (isConnected && waitingForNetworkConnection.value) {
           triggerRetry()
         }
@@ -1155,10 +1168,14 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
             null
           }) ?: true
         val dataSaver = it[echo.music.iad1tya.constants.DataSaverEnabledKey] ?: false
-        if (dataSaver) false else preload
+        (preload && !dataSaver) to dataSaver
       }
       .distinctUntilChanged()
-      .collect(scope) { cachedPreloadEnabled = it }
+      .collect(scope) { (preloadEnabled, dataSaver) ->
+        cachedPreloadEnabled = preloadEnabled
+        bufferDataSaverEnabled = dataSaver
+        preloadUpcomingItems()
+      }
 
     dataStore.data
       .map {
@@ -1614,6 +1631,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     val silenceProcessor = SilenceDetectorAudioProcessor { handleLongSilenceDetected() }
 
     val stereoWidener = StereoWidenerAudioProcessor()
+    val bandwidthMeter = DefaultBandwidthMeter.getSingletonInstance(this)
 
     runBlocking {
       val skipSilence = dataStore.get(SkipSilenceKey, false)
@@ -1628,7 +1646,14 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         .setRenderersFactory(
           createRenderersFactory(eqProcessor, silenceProcessor, duckProcessor, stereoWidener)
         )
-        .setLoadControl(PlaybackBufferControl(::verifyPlaybackTrack))
+        .setBandwidthMeter(bandwidthMeter)
+        .setLoadControl(
+          PlaybackBufferControl(
+            verifyTrack = ::verifyPlaybackTrack,
+            bandwidthEstimate = { bandwidthMeter.bitrateEstimate },
+            isDataRestricted = { bufferDataSaverEnabled || bufferNetworkMetered },
+          )
+        )
         .setHandleAudioBecomingNoisy(true)
         .setWakeMode(C.WAKE_MODE_NETWORK)
         .setAudioAttributes(
@@ -2111,6 +2136,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     loadMoreJob?.cancel()
     loadMoreJob = null
     currentQueue = queue
+    val startGeneration = queueGeneration
     queueTitle = null
     val persistShuffleAcrossQueues = dataStore.get(PersistentShuffleAcrossQueuesKey, false)
     val previousShuffleEnabled = player.shuffleModeEnabled
@@ -2130,14 +2156,20 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     return scope.launch(SilentHandler) {
       val initialStatus =
         withContext(Dispatchers.IO) {
-          queue
+          val status = queue
             .getInitialStatus()
             .filterExplicit(dataStore.get(HideExplicitKey, false))
             .filterVideoSongs(
               dataStore.get(HideVideoSongsKey, false) ||
                 dataStore.get(echo.music.iad1tya.constants.DataSaverEnabledKey, false)
             )
+          val tailStart = status.mediaItemIndex + 1
+          if (queue is YouTubeQueue && queue.hasGeneratedMusicRecommendations && tailStart in 1 until status.items.size) {
+            val tail = localTasteEngine.rankAutoplay(status.items.drop(tailStart))
+            status.copy(items = status.items.take(tailStart) + tail)
+          } else status
         }
+      if (queueGeneration != startGeneration) return@launch
       if (queue.preloadItem != null && player.playbackState == STATE_IDLE) return@launch
       if (initialStatus.title != null) {
         queueTitle = initialStatus.title
@@ -2223,27 +2255,31 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
     val currentIndex = player.currentMediaItemIndex
     val currentMediaId = currentMediaMetadata.id
+    val startGeneration = queueGeneration
 
     scope.launch(SilentHandler) {
       val radioQueue = YouTubeQueue(endpoint = WatchEndpoint(videoId = currentMediaId))
 
       try {
-        val initialStatus =
+        val (title, radioItems) =
           withContext(Dispatchers.IO) {
-            radioQueue
+            val status = radioQueue
               .getInitialStatus()
               .filterExplicit(dataStore.get(HideExplicitKey, false))
               .filterVideoSongs(
                 dataStore.get(HideVideoSongsKey, false) ||
                   dataStore.get(echo.music.iad1tya.constants.DataSaverEnabledKey, false)
               )
+            val candidates = status.items.filterNot { it.mediaId == currentMediaId }
+            status.title to if (radioQueue.hasGeneratedMusicRecommendations) {
+              localTasteEngine.rankAutoplay(candidates)
+            } else candidates
           }
 
-        if (initialStatus.title != null) {
-          queueTitle = initialStatus.title
-        }
-
-        val radioItems = initialStatus.items.filter { item -> item.mediaId != currentMediaId }
+        if (queueGeneration != startGeneration || player.currentMediaItemIndex != currentIndex ||
+          player.currentMediaItem?.mediaId != currentMediaId
+        ) return@launch
+        if (title != null) queueTitle = title
 
         if (radioItems.isNotEmpty()) {
           val itemCount = player.mediaItemCount
@@ -2272,7 +2308,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         loadMoreJob = null
         currentQueue = radioQueue
       } catch (e: Exception) {
-
+        if (e is CancellationException) throw e
         try {
           val nextResult =
             withContext(Dispatchers.IO) {
@@ -2282,7 +2318,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
             val relatedPage =
               withContext(Dispatchers.IO) { YouTube.related(relatedEndpoint).getOrNull() }
             relatedPage?.songs?.let { songs ->
-              val radioItems =
+              val candidates =
                 songs
                   .filter { it.id != currentMediaId }
                   .map { it.toMediaItem() }
@@ -2292,6 +2328,10 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
                       dataStore.get(echo.music.iad1tya.constants.DataSaverEnabledKey, false)
                   )
 
+              val radioItems = localTasteEngine.rankAutoplay(candidates)
+              if (queueGeneration != startGeneration || player.currentMediaItemIndex != currentIndex ||
+                player.currentMediaItem?.mediaId != currentMediaId
+              ) return@launch
               if (radioItems.isNotEmpty()) {
                 val itemCount = player.mediaItemCount
                 if (itemCount > currentIndex + 1) {
@@ -2313,6 +2353,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
               }
             }
           }
+        } catch (e: CancellationException) {
+          throw e
         } catch (_: Exception) {}
       }
     }
@@ -2913,6 +2955,9 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     mediaItem: MediaItem?,
     reason: Int,
   ) {
+    if (allowAvailableQualityFor != mediaItem?.mediaId) {
+      allowAvailableQualityFor = null
+    }
     retainedResolutionMediaId?.takeIf { it != mediaItem?.mediaId }?.let {
       invalidateStreamUrls(it)
       retainedResolutionMediaId = null
@@ -2927,14 +2972,15 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         trackedPlayStartTs = 0L
       }
       val durationMs = if (trackedDurationMs > 0L) trackedDurationMs else (prevItem.metadata?.duration?.takeIf { it > 0 }?.times(1000L) ?: 0L)
-      val wasAutoTransition = reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO
-      val completionRatio = if (durationMs > 0L) trackedAccumulatedPlayMs.toFloat() / durationMs else 0f
-      val wasSkip = !wasAutoTransition && completionRatio < 0.85f
+      val earlySkipLimit = if (durationMs > 0L) minOf(30_000L, durationMs / 4) else 30_000L
+      val wasEarlySkip = reason == Player.MEDIA_ITEM_TRANSITION_REASON_SEEK &&
+        mediaItem != null && prevItem.mediaId != mediaItem.mediaId &&
+        trackedAccumulatedPlayMs in 1L until earlySkipLimit
       val wasFlowBrowse =
         currentQueue is MusicFlowQueue &&
           trackedAccumulatedPlayMs < MusicFlowQueue.BROWSE_SKIP_THRESHOLD_MS
 
-      if (wasSkip && !wasFlowBrowse && trackedAccumulatedPlayMs > 0L) {
+      if (wasEarlySkip && !wasFlowBrowse && !dataStore.get(PauseListenHistoryKey, false)) {
         val prevMeta = prevItem.metadata
         val title = prevMeta?.title ?: prevItem.mediaMetadata.title?.toString().orEmpty()
         val artist = prevMeta?.artists?.joinToString(", ") { it.name }
@@ -3035,13 +3081,16 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         scope.launch(SilentHandler) {
           val mediaItems =
             withContext(Dispatchers.IO) {
-              queueAtStart
+              val page = queueAtStart
                 .nextPage()
                 .filterExplicit(dataStore.get(HideExplicitKey, false))
                 .filterVideoSongs(
                   dataStore.get(HideVideoSongsKey, false) ||
                     dataStore.get(echo.music.iad1tya.constants.DataSaverEnabledKey, false)
                 )
+              if (queueAtStart is YouTubeQueue && queueAtStart.hasGeneratedMusicRecommendations) {
+                localTasteEngine.rankAutoplay(page)
+              } else page
             }
           if (
             isActive &&
@@ -3138,7 +3187,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         val radioQueue = YouTubeQueue(endpoint = WatchEndpoint(videoId = seedId))
         val items =
           withContext(Dispatchers.IO) {
-            radioQueue
+            val candidates = radioQueue
               .getInitialStatus()
               .filterExplicit(dataStore.get(HideExplicitKey, false))
               .filterVideoSongs(
@@ -3146,6 +3195,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
                   dataStore.get(echo.music.iad1tya.constants.DataSaverEnabledKey, false)
               )
               .items
+            localTasteEngine.rankAutoplay(candidates.filterNot { it.mediaId == seedId })
           }
         if (
           queueGeneration != startGeneration ||
@@ -3203,6 +3253,12 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       sessionBitmapLoader.prefetch(artworkUri)
       warmProviderArtwork(artworkUri)
       index = timeline.getNextWindowIndex(index, player.repeatMode, player.shuffleModeEnabled)
+    }
+  }
+
+  override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+    if (reason == Player.TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED && playerInitialized.value) {
+      preloadUpcomingItems()
     }
   }
 
@@ -3303,6 +3359,9 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
     if (playWhenReady) {
       setupLoudnessEnhancer()
+      preloadUpcomingItems()
+    } else {
+      preloadJob?.cancel()
     }
   }
 
@@ -3423,6 +3482,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
       applyShuffleOrder(currentIndex, totalCount, shufflePlaylistFirst)
     }
+    preloadUpcomingItems()
 
     if (dataStore.get(RememberShuffleAndRepeatKey, true)) {
       scope.launch { dataStore.edit { settings -> settings[ShuffleModeKey] = shuffleModeEnabled } }
@@ -3603,7 +3663,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         error,
         "Player error occurred for $mediaId: errorCode=${error.errorCode}, message=${error.message}"
       )
-    if (generateSequence<Throwable>(error) { it.cause }.any { it is SelectedQualityUnavailable }) {
+    if (error.selectedQualityError() != null) {
       if (dataStore.get(AutoSkipNextOnErrorKey, false)) skipOnError() else stopOnError()
       return
     }
@@ -3690,6 +3750,23 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       Timber.tag(TAG).d("Stopping playback due to unrecoverable error")
       stopOnError()
     }
+  }
+
+  internal fun canPlayCurrentWithAvailableQuality(error: PlaybackException): Boolean {
+    val policy = playbackQualityPolicy
+    return policy.requested == AudioQuality.LOSSLESS && policy.requiresCertainQuality &&
+      error.selectedQualityError()?.quality == AudioQuality.LOSSLESS && playerInitialized.value &&
+      player.playerError === error && player.currentMediaItem != null
+  }
+
+  internal fun playCurrentWithAvailableQuality(error: PlaybackException) {
+    if (!canPlayCurrentWithAvailableQuality(error)) return
+    val mediaId = player.currentMediaItem?.mediaId ?: return
+    allowAvailableQualityFor = mediaId
+    retryJob?.cancel()
+    resetRetryCount(mediaId)
+    player.prepare()
+    player.play()
   }
 
   private fun performAggressiveCacheClear(mediaId: String) {
@@ -4160,7 +4237,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         return@Factory dataSpec
       }
 
-      val policy = playbackQualityPolicy
+      val policy = playbackPolicyFor(mediaId)
       val completedCacheKey = downloadUtil.completedDownloadCacheKey(mediaId)
       val useLossyDownloadFirst = policy.canStartWithLossyDownload()
       if (
@@ -4184,13 +4261,22 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           if (useLossyDownloadFirst && completedCacheKey == null && hasLegacyDownload(mediaId)) {
             return@runBlocking null
           }
-          resolveRemoteTrack(mediaId, policy).also { resolved ->
-            if (playbackQualityPolicy == policy) resolutionCache[streamKey] = resolved
+          try {
+            resolveRemoteTrack(mediaId, policy).also { resolved ->
+              if (playbackPolicyFor(mediaId) == policy) resolutionCache[streamKey] = resolved
+            }
+          } catch (error: Exception) {
+            if (policy.requested != AudioQuality.LOSSLESS || !policy.allowDowngrade ||
+              (error !is PlaybackException && error !is SelectedQualityUnavailable) ||
+              (completedCacheKey == null && !hasLegacyDownload(mediaId))
+            ) throw error
+            null
           }
         }
       if (stream == null) {
         scope.launch(Dispatchers.IO) { recoverSong(mediaId, isOfflinePlayback = true) }
-        return@Factory dataSpec
+        return@Factory if (completedCacheKey == null) dataSpec
+        else dataSpec.buildUpon().setKey(completedCacheKey).build()
       }
       registerPlayback(mediaId, stream, completedCacheKey == null)
       stream.resolve(dataSpec.buildUpon().setKey(stream.cacheKey(mediaId)).build())
@@ -4210,8 +4296,16 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       allowDowngrade = dataStore.get(AllowQualityDowngradeKey, true),
     )
 
+  private fun playbackPolicyFor(mediaId: String): PlaybackQualityPolicy {
+    val policy = playbackQualityPolicy
+    return if (policy.requested == AudioQuality.LOSSLESS && allowAvailableQualityFor == mediaId) {
+      PlaybackQualityPolicy(AudioQuality.HIGH, allowDowngrade = true)
+    } else policy
+  }
+
   private fun applyPlaybackQualityPolicy(policy: PlaybackQualityPolicy) {
     if (policy == playbackQualityPolicy) return
+    allowAvailableQualityFor = null
     playbackQualityPolicy = policy
     refreshRemotePlayback(restartCurrent = true)
   }
@@ -4221,7 +4315,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     val refreshedCache = ConcurrentHashMap<String, ResolvedStream>()
     retainedResolutionMediaId = null
     if (!restartCurrent && item != null) {
-      val key = playbackQualityPolicy.streamKey(item.mediaId)
+      val key = playbackPolicyFor(item.mediaId).streamKey(item.mediaId)
       songUrlCache[key]?.let { stream ->
         // Keep later reads from the active media source on the same rendition.
         refreshedCache[key] = stream
@@ -4245,11 +4339,11 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   }
 
   private fun currentTrackCanUpgradeToLossless(): Boolean {
-    val policy = playbackQualityPolicy
+    val mediaId = player.currentMediaItem?.mediaId ?: return false
+    val policy = playbackPolicyFor(mediaId)
     if (policy.requested != AudioQuality.LOSSLESS || player.playbackState == Player.STATE_ENDED) {
       return false
     }
-    val mediaId = player.currentMediaItem?.mediaId ?: return false
     if (mediaId.isLocalMediaId() || mediaId.startsWith("navidrome_") || mediaId.startsWith("jellyfin_")) {
       return false
     }
@@ -4293,7 +4387,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   }
 
   private fun verifyPlaybackTrack(mediaId: String, actual: AudioSourceQuality) {
-    val policy = playbackQualityPolicy
+    val policy = playbackPolicyFor(mediaId)
     if (mediaId.isLocalMediaId() || !policy.requiresCertainQuality) return
     val declared = songUrlCache[policy.streamKey(mediaId)]?.playbackData?.format?.sourceQuality
     val measured = actual.copy(bitrate = actual.bitrate ?: declared?.bitrate)
@@ -4301,7 +4395,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   }
 
   private fun qualityUnavailable(policy: PlaybackQualityPolicy): SelectedQualityUnavailable =
-    SelectedQualityUnavailable(getString(R.string.playback_quality_unavailable, policy.requested.label))
+    SelectedQualityUnavailable(policy.requested, getString(R.string.playback_quality_unavailable, policy.requested.label))
 
   private suspend fun resolveRemoteTrack(
     mediaId: String,
@@ -4892,7 +4986,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   suspend fun getStreamUrl(mediaId: String): String? {
     return withContext(Dispatchers.IO) {
       try {
-        resolveRemoteTrack(mediaId, playbackQualityPolicy).url
+        resolveRemoteTrack(mediaId, playbackPolicyFor(mediaId)).url
       } catch (e: kotlinx.coroutines.CancellationException) {
         throw e
       } catch (e: Exception) {
@@ -5765,6 +5859,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     const val NOTIFICATION_ID = 888
     const val ERROR_CODE_NO_STREAM = 1000001
     const val CHUNK_LENGTH = 512 * 1024L
+    private const val NEXT_LOSSLESS_CACHE_LIMIT = 2 * 1024 * 1024L
+    private const val PRELOAD_BUFFER_RUNWAY_MS = 12_000L
     const val PERSISTENT_QUEUE_FILE = "persistent_queue.data"
     const val PERSISTENT_AUTOMIX_FILE = "persistent_automix.data"
     const val PERSISTENT_PLAYER_STATE_FILE = "persistent_player_state.data"
@@ -5789,58 +5885,50 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   private var preloadJob: kotlinx.coroutines.Job? = null
 
   private fun preloadUpcomingItems() {
-    val preloadEnabled = cachedPreloadEnabled
-    if (!preloadEnabled) return
-
-    val preloadLimit = cachedPreloadLimit
-    val preloadLyrics = cachedPreloadLyrics
-
-    val currentIndex = player.currentMediaItemIndex
-    if (currentIndex == androidx.media3.common.C.INDEX_UNSET) return
-
-    val limit = kotlin.math.min(preloadLimit, player.mediaItemCount - currentIndex - 1)
-    if (limit <= 0) return
-
-    val upcomingMediaIds = mutableListOf<String>()
-    for (i in 1..limit) {
-      upcomingMediaIds.add(player.getMediaItemAt(currentIndex + i).mediaId)
-    }
-
     preloadJob?.cancel()
+    if (!canPreloadOnline() || !player.playWhenReady) return
+
+    val preloadLyrics = cachedPreloadLyrics
+    val currentId = player.currentMediaItem?.mediaId ?: return
+    val currentIndex = player.currentMediaItemIndex
+    val timeline = player.currentTimeline
+    if (currentIndex !in 0 until timeline.windowCount) return
+    val limit = cachedPreloadLimit.coerceIn(0, timeline.windowCount - 1)
+    val preloadRepeatMode = if (player.repeatMode == REPEAT_MODE_ALL) REPEAT_MODE_ALL else REPEAT_MODE_OFF
+    val upcomingMediaIds = buildList {
+      var index = currentIndex
+      repeat(limit) {
+        index = timeline.getNextWindowIndex(index, preloadRepeatMode, player.shuffleModeEnabled)
+        if (index == C.INDEX_UNSET) return@buildList
+        add(player.getMediaItemAt(index).mediaId)
+      }
+    }
+    if (upcomingMediaIds.isEmpty()) return
+
     preloadJob =
       scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-        kotlinx.coroutines.delay(8000L) // 8-second grace period before prefetching
-        for (mediaId in upcomingMediaIds) {
+        for ((upcomingIndex, mediaId) in upcomingMediaIds.withIndex()) {
+          if (!awaitPreloadRoom(currentId)) break
           val policy = playbackQualityPolicy
           val streamKey = policy.streamKey(mediaId)
           val resolutionCache = songUrlCache
-          val hasCachedStream =
-            resolutionCache[streamKey]?.expiresAtMs?.let { it > System.currentTimeMillis() } == true
+          val cachedStream = resolutionCache[streamKey]?.takeIf { it.expiresAtMs > System.currentTimeMillis() }
           val completedCacheKey = downloadUtil.completedDownloadCacheKey(mediaId)
           val useLossyDownloadFirst = policy.canStartWithLossyDownload()
           val useCompletedDownload = completedCacheKey != null &&
             policy.canStartWithCompletedDownload(completedCacheKey, useLossyDownloadFirst)
           if (
-            !mediaId.isLocalMediaId() && !hasCachedStream && !useCompletedDownload &&
+            !mediaId.isLocalMediaId() && !useCompletedDownload &&
               (!useLossyDownloadFirst || completedCacheKey != null || !hasLegacyDownload(mediaId))
           ) {
             try {
-              val resolved = resolveRemoteTrack(mediaId, policy)
+              val resolved = cachedStream ?: resolveRemoteTrack(mediaId, policy)
               if (!isActive || playbackQualityPolicy != policy || songUrlCache !== resolutionCache) break
               val stream = resolutionCache.compute(streamKey) { _, existing ->
                 existing?.takeIf { it.expiresAtMs > System.currentTimeMillis() } ?: resolved
               } ?: resolved
-              val knownLength = stream.playbackData?.format?.contentLength?.takeIf { it > 0 }
-              val firstChunk = DataSpec.Builder()
-                .setUri(stream.url.toUri())
-                .setHttpRequestHeaders(stream.headers)
-                .setKey(stream.cacheKey(mediaId))
-                .setLength(knownLength?.coerceAtMost(CHUNK_LENGTH) ?: CHUNK_LENGTH)
-                .build()
-              // Warm the next track without competing with the active stream's buffer.
-              kotlinx.coroutines.runInterruptible {
-                CacheWriter(createCacheDataSource().createDataSource(), firstChunk, null, null).cache()
-              }
+              if (!awaitPreloadRoom(currentId)) break
+              warmUpcomingAudio(mediaId, stream, immediatelyNext = upcomingIndex == 0)
             } catch (e: kotlinx.coroutines.CancellationException) {
               throw e
             } catch (_: SelectedQualityUnavailable) {
@@ -5884,6 +5972,50 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           }
         }
       }
+  }
+
+  private fun isActiveNetworkMetered(): Boolean =
+    runCatching { connectivityManager.isActiveNetworkMetered }.getOrDefault(true)
+
+  private fun canPreloadOnline(): Boolean =
+    cachedPreloadEnabled && !bufferDataSaverEnabled && isNetworkConnected.value && !isActiveNetworkMetered()
+
+  private suspend fun awaitPreloadRoom(currentId: String): Boolean = withContext(Dispatchers.Main) {
+    while (canPreloadOnline() && player.playWhenReady && player.currentMediaItem?.mediaId == currentId) {
+      val state = player.playbackState
+      if (state == Player.STATE_IDLE || state == Player.STATE_ENDED) break
+      val duration = player.duration
+      val bufferedPosition = player.bufferedPosition
+      val fullyBuffered = duration > 0 && bufferedPosition >= duration
+      val runwayMs = bufferedPosition - player.currentPosition
+      if (state == Player.STATE_READY &&
+        (fullyBuffered || runwayMs >= PRELOAD_BUFFER_RUNWAY_MS)
+      ) return@withContext true
+      delay(500)
+    }
+    false
+  }
+
+  private suspend fun warmUpcomingAudio(mediaId: String, stream: ResolvedStream, immediatelyNext: Boolean) {
+    val format = stream.playbackData?.format
+    val firstAudioBytes = if (immediatelyNext && format?.sourceQuality?.isLossless == true) {
+      val bitrate = format.sourceQuality.bitrate ?: estimatedLosslessBitrate(
+        format.audioSampleRate ?: 0, format.audioChannels ?: 0,
+      )
+      (bitrate * 10L / 8).coerceIn(CHUNK_LENGTH, NEXT_LOSSLESS_CACHE_LIMIT)
+    } else CHUNK_LENGTH
+    val length = format?.contentLength?.takeIf { it > 0 }?.coerceAtMost(firstAudioBytes) ?: firstAudioBytes
+    val cacheKey = stream.cacheKey(mediaId)
+    if (playerCache.isCached(cacheKey, 0, length)) return
+    val firstChunk = DataSpec.Builder()
+      .setUri(stream.url.toUri())
+      .setHttpRequestHeaders(stream.headers)
+      .setKey(cacheKey)
+      .setLength(length)
+      .build()
+    kotlinx.coroutines.runInterruptible {
+      CacheWriter(createCacheDataSource().createDataSource(), firstChunk, null, null).cache()
+    }
   }
 
   private fun checkAndSubmitListenBrainzFinished() {

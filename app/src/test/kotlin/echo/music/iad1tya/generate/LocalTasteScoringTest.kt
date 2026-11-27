@@ -31,8 +31,8 @@ class LocalTasteScoringTest {
       lastPlayedAtMillis = System.currentTimeMillis(),
     )
 
-    // Base score: ln(1.0 + 1000/60000) * 2.0 (PLAY_WEIGHT) + 1.5 (RECENCY_BONUS)
-    val expectedBase = (kotlin.math.ln(1.0 + 1000.0 / 60_000.0).toFloat() * PLAY_WEIGHT) + RECENCY_BONUS
+    val expectedBase = (kotlin.math.ln(1.0 + 1000.0 / 60_000.0).toFloat() * PLAY_WEIGHT) +
+      (kotlin.math.ln(2.0).toFloat() * COMPLETED_PLAY_WEIGHT) + RECENCY_BONUS
     // In afternoon: hourBonus = 1.0
     val afternoonScore = scoreStats(baseEntity, emptySet(), "afternoon")
     assertEquals(expectedBase, afternoonScore, 0.01f)
@@ -41,13 +41,50 @@ class LocalTasteScoringTest {
     val likedScore = scoreStats(baseEntity, setOf("song|artist"), "afternoon")
     assertEquals(expectedBase + LIKED_BONUS, likedScore, 0.01f)
 
-    // With skip penalty: skipCount = 2 -> expectedBase - (2 * 3.0)
+    // The second skip counts against the score. The first does not.
+    assertEquals(expectedBase, scoreStats(baseEntity.copy(skipCount = 1), emptySet(), "afternoon"), 0.01f)
     val skippedEntity = baseEntity.copy(skipCount = 2)
     val skippedScore = scoreStats(skippedEntity, emptySet(), "afternoon")
-    assertEquals((expectedBase - 2 * SKIP_PENALTY).coerceAtLeast(0f), skippedScore, 0.01f)
+    assertEquals((expectedBase - SKIP_PENALTY).coerceAtLeast(0f), skippedScore, 0.01f)
 
     // Verify skip penalty is heaviest single penalty (-3.0 per skip)
     assertTrue(SKIP_PENALTY > PLAY_WEIGHT)
+  }
+
+  @Test
+  fun completedReplaysEarnMoreThanTheSameMinutesOfPartialListening() {
+    val played = SongPlayStatsEntity(trackKey = "track|artist", totalPlayTimeMs = 360_000L)
+    val playedOnce = played.copy(playCount = 1)
+    val replayed = played.copy(playCount = 3)
+
+    assertTrue(scoreStats(playedOnce, emptySet(), "afternoon") > scoreStats(played, emptySet(), "afternoon"))
+    assertTrue(scoreStats(replayed, emptySet(), "afternoon") > scoreStats(playedOnce, emptySet(), "afternoon"))
+  }
+
+  @Test
+  fun oneSkipKeepsTheDiscoveryScoreAndExplicitLikesOutrankIt() {
+    val key = "discovery|artist"
+    val skippedOnce = SongPlayStatsEntity(trackKey = key, skipCount = 1)
+
+    val discoveryScore = scoreTasteCandidate(key, null, emptySet(), "afternoon")
+    assertEquals(discoveryScore, scoreTasteCandidate(key, skippedOnce, emptySet(), "afternoon"), 0.01f)
+    assertTrue(scoreTasteCandidate(key, null, setOf(key), "afternoon") > discoveryScore)
+    assertTrue(applyCandidateFilter(skippedOnce.copy(skipCount = 3), isLiked = true))
+    assertTrue(applyCandidateFilter(skippedOnce.copy(skipCount = 3, playCount = 1)))
+  }
+
+  @Test
+  fun artistVarietySeparatesCloseCandidatesWithoutDroppingThem() {
+    data class Track(val title: String, val artist: String, val score: Float)
+
+    val favorite = Track("Favorite", "Same Artist", 8f)
+    val replay = Track("Replay", "Same Artist", 7.5f)
+    val discovery = Track("Discovery", "Other Artist", 7f)
+
+    assertEquals(
+      listOf(favorite, discovery, replay),
+      rankWithArtistVariety(listOf(favorite, replay, discovery), primaryArtist = { it.artist }) { it.score },
+    )
   }
 
   @Test

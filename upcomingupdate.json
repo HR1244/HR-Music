@@ -1,7 +1,9 @@
 {
   "features": [
+    "Open Liked songs and Recently played directly from Home",
+    "Autoplay ranks related songs using likes, completed plays and repeated early skips",
     "HR Music introduces its own launcher logo and simplifies About and startup",
-    "Playback can keep the selected quality when automatic quality reduction is off. Lossless playback buffers up to one minute before starting",
+    "Playback can keep the selected quality when automatic quality reduction is off",
     "Choose a separate download quality, including Lossless only for verified lossless audio",
     "HR Music publishes signed Universal GMS builds from GitHub version tags and offers verified updates inside the app",
     "HR Music audio extensions can be deployed to the listener’s Cloudflare or Vercel account and connected through Android sharing or a configured Vercel return link",
@@ -13,6 +15,8 @@
     "Library UI: separate the Library overview into swipeable In App Library and Spotify underlined source tabs with separate sort controls, circular horizontal playlist preview, adaptive grid and inline track search for Spotify playlists, and animated refresh sync status messages (#808)"
   ],
   "bug_fixes": [
+    "Lossless playback adapts its startup buffer and waits for enough audio before warming the next track",
+    "Play an available quality for the current song when strict Lossless finds no source",
     "Lossless playback tries matching extension streams before older lossy downloads when online and prefers verified 44.1 kHz FLAC",
     "Show the selected audio track's codec and sample rate in the player and Song Info",
     "Set up the Android SDK and debug signing on GitHub runners and allow retrying a release from its existing tag",

@@ -6,9 +6,6 @@ import com.music.innertube.models.WatchEndpoint
 import echo.music.iad1tya.db.MusicDatabase
 import echo.music.iad1tya.db.daos.RecommendationExclusionDao
 import echo.music.iad1tya.db.daos.SongPlayStatsDao
-import echo.music.iad1tya.db.entities.PlaylistEntity
-import echo.music.iad1tya.db.entities.PlaylistSongMap
-import echo.music.iad1tya.db.entities.SongEntity
 import echo.music.iad1tya.db.entities.SongPlayStatsEntity
 import echo.music.iad1tya.utils.lastfm.LastFmTasteApi
 import javax.inject.Inject
@@ -16,7 +13,6 @@ import javax.inject.Singleton
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 
@@ -66,13 +62,10 @@ open class RecommendationEngine @Inject constructor(
         return@withContext Result.failure(IllegalStateException("No listening history available yet"))
       }
 
-      val likedSongs = database?.likedSongsByRowIdAsc()?.firstOrNull().orEmpty()
-      val likedKeys = likedSongs.map { song ->
-        trackKeyOf(song.song.title, song.artists.joinToString(", ") { it.name })
-      }.toSet()
+      val likedKeys = likedTrackKeys()
 
       val eligibleSeeds = recentStats
-        .filter { it.trackKey !in exclusions && applyCandidateFilter(it) }
+        .filter { it.trackKey !in exclusions && applyCandidateFilter(it, it.trackKey in likedKeys) }
         .sortedByDescending { scoreStats(it, likedKeys, timeOfDay) }
 
       if (eligibleSeeds.isEmpty()) {
@@ -163,8 +156,7 @@ open class RecommendationEngine @Inject constructor(
       val combinedCandidates = (externalCandidates + localCandidates)
         .distinctBy { it.id }
         .filter { songItem ->
-          val artistName = songItem.artists.joinToString(", ") { it.name }.trim()
-          val key = trackKeyOf(songItem.title, artistName)
+          val key = songItem.tasteKey
           if (key in seenKeys) false else {
             seenKeys.add(key)
             true
@@ -173,10 +165,7 @@ open class RecommendationEngine @Inject constructor(
         .take(maxCandidatesToScore)
 
       // Batch Room stats lookups instead of calling find for each candidate
-      val candidateKeys = combinedCandidates.map { songItem ->
-        val artistName = songItem.artists.joinToString(", ") { it.name }.trim()
-        trackKeyOf(songItem.title, artistName)
-      }
+      val candidateKeys = combinedCandidates.map { it.tasteKey }
       val statsByKey: Map<String, SongPlayStatsEntity> = songPlayStatsDao.findByKeys(candidateKeys)
         .associateBy { it.trackKey }
 
@@ -205,19 +194,15 @@ open class RecommendationEngine @Inject constructor(
 
       for (songItem in combinedCandidates) {
         val artistName = songItem.artists.joinToString(", ") { it.name }.trim()
-        val key = trackKeyOf(songItem.title, artistName)
+        val key = songItem.tasteKey
 
         val localStats = statsByKey[key]
-        val baseScore = if (localStats != null) {
-          scoreStats(localStats, likedKeys, timeOfDay)
-        } else {
-          // Unplayed discovery candidate base score
-          5.0f
-        }
+        if (localStats != null && !applyCandidateFilter(localStats, key in likedKeys)) continue
+        val baseScore = scoreTasteCandidate(key, localStats, likedKeys, timeOfDay)
 
         val isSimilarTrack = key in similarTrackKeys
         val isSimilarArtist = artistName.lowercase() in similarArtistNames
-        val leadArtist = songItem.artists.firstOrNull()?.name?.trim()?.lowercase().orEmpty()
+        val leadArtist = songItem.leadArtist.trim().lowercase()
         val candidateGenres = genresByArtist[leadArtist].orEmpty()
 
         val hasGenreIntersection = if (userTopGenres.isNotEmpty() && candidateGenres.isNotEmpty()) {
@@ -247,9 +232,9 @@ open class RecommendationEngine @Inject constructor(
         scoredCandidates.add(CandidateWithScore(songItem, finalScore))
       }
 
-      val sortedSongs = scoredCandidates
-        .sortedByDescending { it.score }
-        .map { it.song }
+      val sortedSongs = rankWithArtistVariety(scoredCandidates, count, primaryArtist = { it.song.leadArtist }) {
+        it.score
+      }.map { it.song }
 
       val finalSongs = if (sortedSongs.size >= 5) {
         sortedSongs.take(count)

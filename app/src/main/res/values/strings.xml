@@ -22,6 +22,7 @@
 
     <!-- Home -->
     <string name="history">History</string>
+    <string name="recently_played">Recently played</string>
     <string name="stats">Stats</string>
     <string name="mood_and_genres">Mood and Genres</string>
     <string name="account">Account</string>
@@ -402,6 +403,7 @@
     <string name="playback_allow_quality_downgrade">Allow automatic quality downgrade</string>
     <string name="playback_allow_quality_downgrade_desc">Use lower-quality audio when your selected playback quality is unavailable.</string>
     <string name="playback_quality_unavailable">%1$s audio is unavailable for this track.</string>
+    <string name="play_available_quality">Play available quality</string>
     <string name="audio_quality_cellular">Cellular Audio Quality</string>
     <string name="audio_quality_cellular_desc">Streaming quality ceiling on mobile data or metered networks</string>
     <string name="ip_version_auto">Automatic</string>

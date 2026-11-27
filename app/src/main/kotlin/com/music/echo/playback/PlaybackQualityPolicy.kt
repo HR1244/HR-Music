@@ -67,4 +67,7 @@ internal data class PlaybackQualityPolicy(
 internal val PlayerResponse.StreamingData.Format.sourceQuality: AudioSourceQuality
   get() = AudioSourceQuality.from(mimeType, bitrate = averageBitrate ?: bitrate)
 
-internal class SelectedQualityUnavailable(message: String) : IllegalStateException(message)
+internal class SelectedQualityUnavailable(val quality: AudioQuality, message: String) : IllegalStateException(message)
+
+internal fun Throwable.selectedQualityError(): SelectedQualityUnavailable? =
+  generateSequence(this) { it.cause }.filterIsInstance<SelectedQualityUnavailable>().firstOrNull()

@@ -1,9 +1,11 @@
 package echo.music.iad1tya.ui.screens
 
 import androidx.activity.compose.BackHandler
+import androidx.annotation.DrawableRes
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
@@ -13,20 +15,24 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -82,6 +88,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -172,6 +179,38 @@ private fun NavController.navigateToPlaylistItem(playlist: PlaylistItem) {
     "LM" -> navigate("auto_playlist/liked")
     "SE" -> navigate("auto_playlist/downloaded")
     else -> navigate("online_playlist/$playlistId")
+  }
+}
+
+@Composable
+private fun HomeLibraryShortcut(
+  label: String,
+  @DrawableRes icon: Int,
+  onClick: () -> Unit,
+  modifier: Modifier = Modifier,
+) {
+  Row(
+    modifier = modifier
+      .fillMaxHeight()
+      .heightIn(min = 48.dp)
+      .clip(RoundedCornerShape(12.dp))
+      .background(MaterialTheme.colorScheme.surfaceContainer)
+      .clickable(role = Role.Button, onClick = onClick)
+      .padding(horizontal = 12.dp, vertical = 8.dp),
+    horizontalArrangement = Arrangement.spacedBy(8.dp),
+    verticalAlignment = Alignment.CenterVertically,
+  ) {
+    Icon(
+      painter = painterResource(icon),
+      contentDescription = null,
+      modifier = Modifier.size(18.dp),
+      tint = MaterialTheme.colorScheme.onSurface,
+    )
+    Text(
+      text = label,
+      style = MaterialTheme.typography.labelLarge,
+      color = MaterialTheme.colorScheme.onSurface,
+    )
   }
 }
 
@@ -971,6 +1010,31 @@ fun HomeScreen(
             currentValue = selectedChip,
             onValueUpdate = { viewModel.toggleChip(it) }
           )
+        }
+
+        if (selectedChip == null) {
+          item(key = "library_shortcuts") {
+            Row(
+              modifier = Modifier.fillMaxWidth()
+                .windowInsetsPadding(WindowInsets.systemBars.only(WindowInsetsSides.Horizontal))
+                .padding(horizontal = 16.dp, vertical = 6.dp)
+                .height(IntrinsicSize.Min),
+              horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+              HomeLibraryShortcut(
+                label = stringResource(R.string.liked_songs),
+                icon = R.drawable.favorite_border,
+                onClick = { navController.navigate("auto_playlist/liked") { launchSingleTop = true } },
+                modifier = Modifier.weight(1f),
+              )
+              HomeLibraryShortcut(
+                label = stringResource(R.string.recently_played),
+                icon = R.drawable.history,
+                onClick = { navController.navigate("history") { launchSingleTop = true } },
+                modifier = Modifier.weight(1f),
+              )
+            }
+          }
         }
 
         if (selectedChip == null && !isWrappedDismissed) {

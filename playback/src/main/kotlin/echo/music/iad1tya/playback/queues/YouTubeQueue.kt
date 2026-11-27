@@ -23,6 +23,9 @@ class YouTubeQueue(
   /** Started from an episode: YouTube's radio mixes in music, which must not follow it. */
   private var isEpisodeRadio = false
 
+  val hasGeneratedMusicRecommendations: Boolean
+    get() = isRadioQueue && !isEpisodeRadio
+
   override suspend fun getInitialStatus(): Queue.Status {
     return withContext(IO) {
       continuation = null

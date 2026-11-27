@@ -14,6 +14,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -26,14 +27,16 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.media3.common.PlaybackException
 import echo.music.iad1tya.R
+import echo.music.iad1tya.playback.selectedQualityError
 
 @Composable
 fun PlaybackError(
   error: PlaybackException,
   retry: () -> Unit,
   modifier: Modifier = Modifier,
+  playAvailableQuality: (() -> Unit)? = null,
 ) {
-
+  val qualityError = error.selectedQualityError()
   val rawErrorMessage =
     error.cause?.cause?.message
       ?: error.cause?.message
@@ -57,7 +60,9 @@ fun PlaybackError(
       rawErrorMessage.contains("UnknownHostException", ignoreCase = true)
 
   val errorMessage =
-    if (isAgeRestricted) {
+    if (qualityError != null) {
+      qualityError.message ?: rawErrorMessage
+    } else if (isAgeRestricted) {
       "This track is unplayable or age-restricted on YouTube Music. We are working on fixing this issue."
     } else if (isNetworkError) {
       "Connection timed out while loading audio stream. Please check your internet connection or tap Retry."
@@ -97,33 +102,39 @@ fun PlaybackError(
       overflow = TextOverflow.Ellipsis
     )
 
-    Spacer(modifier = Modifier.height(4.dp))
-
-    Text(
-      text = "Code: ${getErrorCodeName(error.errorCode)} (${error.errorCode})",
-      style =
-        MaterialTheme.typography.bodySmall.copy(
-          fontFamily = FontFamily.Monospace,
-          fontSize = 11.sp
-        ),
-      color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-      textAlign = TextAlign.Center
-    )
+    if (qualityError == null) {
+      Spacer(modifier = Modifier.height(4.dp))
+      Text(
+        text = "Code: ${getErrorCodeName(error.errorCode)} (${error.errorCode})",
+        style =
+          MaterialTheme.typography.bodySmall.copy(
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp
+          ),
+        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+        textAlign = TextAlign.Center
+      )
+    }
 
     Spacer(modifier = Modifier.height(16.dp))
 
     Button(
-      onClick = retry,
+      onClick = playAvailableQuality ?: retry,
       shape = RoundedCornerShape(20.dp),
       colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
     ) {
-      Icon(
-        painter = painterResource(R.drawable.replay),
-        contentDescription = null,
-        modifier = Modifier.size(18.dp)
-      )
-      Spacer(modifier = Modifier.width(6.dp))
-      Text(text = stringResource(R.string.retry))
+      if (playAvailableQuality == null) {
+        Icon(
+          painter = painterResource(R.drawable.replay),
+          contentDescription = null,
+          modifier = Modifier.size(18.dp)
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+      }
+      Text(text = stringResource(if (playAvailableQuality != null) R.string.play_available_quality else R.string.retry))
+    }
+    if (playAvailableQuality != null) {
+      TextButton(onClick = retry) { Text(text = stringResource(R.string.retry)) }
     }
   }
 }
